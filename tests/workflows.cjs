@@ -1,0 +1,62 @@
+const ts=require('typescript'),fs=require('fs'),vm=require('vm'),assert=require('node:assert/strict');
+const root=process.cwd(),cache={};let saved=null,version=-1;
+const DB={prepare(sql){return {bind(...args){return {async first(){return saved===null?null:{data:saved,version}},async run(){if(sql.startsWith('INSERT')){if(saved!==null)return {meta:{changes:0}};saved=args[1];version=0}else{if(version!==args[2])return {meta:{changes:0}};saved=args[0];version++}return {meta:{changes:1}}}}}}}};
+function mod(path){if(cache[path])return cache[path].exports;const m={exports:{}};cache[path]=m;const js=ts.transpileModule(fs.readFileSync(root+'/'+path+'.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;vm.runInNewContext(js,{module:m,exports:m.exports,require(p){if(p==='cloudflare:workers')return {env:{DB,BRIDGE_KEY:'test',SITE_ORIGIN:'https://example.test'}};return mod(require('path').posix.normalize(require('path').posix.dirname(path)+'/'+p))},crypto:require('node:crypto').webcrypto,Response,Request,URL,TextEncoder,Date,console:{error(){}}});return m.exports;}
+const admin=mod('app/api/data/route'),bridge=mod('app/api/bridge/route'),entry=mod('lib/entry'),flows=mod('lib/workflows');
+const guild='123456789012345678',user='223456789012345678',u2='323456789012345678',u3='423456789012345678';
+async function call(route,b,ok=true){const r=await route.POST(new Request('https://example.test/api',{method:'POST',headers:{origin:'https://example.test','oai-authenticated-user-id':'owner','x-entry-key':'test','content-type':'application/json'},body:JSON.stringify(b)}));const d=await r.json();assert.equal(r.status,ok?200:400,JSON.stringify(d));return d.result;}
+const info={riotId:'月愛るちるVT#ポンコツ',displayName:'配信用の名前',position:'coach',xid:'example',tracker:'https://tracker.gg/valorant/profile/riot/test%23JP/overview',rank:'GOLD 3'};
+function state(){return JSON.parse(saved)}
+function edit(fn){const s=state();fn(s);saved=JSON.stringify(s);version++}
+(async()=>{
+assert.throws(()=>flows.profile({...info,position:'invalid'}));assert.equal(flows.profile({...info,position:undefined}).position,'player');
+assert.equal(flows.profile({...info,riotId:undefined}).riotId,'test#JP');
+assert.equal(flows.riotFromTracker(flows.profile(info).tracker),'月愛るちるVT#ポンコツ');assert.throws(()=>flows.profile({...info,riotId:'Name#   '}));assert.throws(()=>flows.profile({...info,riotId:'Name'}));assert.throws(()=>flows.profile({...info,riotId:'Name#JP#1'}));assert.throws(()=>flows.profile({...info,riotId:'https://example.test#JP1'}));assert.throws(()=>flows.profile({...info,displayName:''}));
+assert.equal(flows.profile(info).tracker,'https://tracker.gg/valorant/profile/riot/'+encodeURIComponent(info.riotId)+'/overview');
+const e=await call(admin,{action:'event',name:'Cup',guild});await call(admin,{action:'settings',guild,unverified:'523456789012345678',verified:'623456789012345678',review:'723456789012345678',panel:'823456789012345678'});
+const a=await call(admin,{action:'team',event:e.id,name:'A',capacity:1}),b=await call(admin,{action:'team',event:e.id,name:'B',capacity:1});assert.equal(a.number,1);assert.equal(b.number,2);edit(s=>s.teams.forEach(t=>t.status='ready'));edit(s=>s.jobs.forEach(j=>j.status='done'));await call(admin,{action:'syncNames',id:a.id});assert.equal(state().jobs.filter(j=>j.kind==='team'&&j.ref===a.id).length,2);
+const reg={...flows.registration(e),minMembers:1,panel:'823456789012345678',changePanel:'923456789012345678',maxPoints:10};await call(admin,{action:'registration',event:e.id,...reg});
+await call(bridge,{action:'code',guild,event:e.id,code:a.code});
+const m=await call(bridge,{action:'submit',guild,team:a.id,user,name:'One',...info});await call(bridge,{action:'submit',guild,team:a.id,user:u2,name:'Two',...info},false);
+await call(admin,{action:'capacity',id:a.id,capacity:2});assert.equal(state().teams[0].capacity,2);await call(admin,{action:'capacity',id:a.id,capacity:1});await call(admin,{action:'capacity',id:a.id,capacity:0},false);await call(admin,{action:'capacity',id:a.id,capacity:31},false);await call(admin,{action:'capacity',id:a.id,capacity:1.5},false);
+await call(admin,{action:'return',id:m.id,reason:'ランクを確認'});assert.equal(state().members[0].displayName,'配信用の名前');assert.equal(state().members[0].riotId,info.riotId);assert.equal(state().members[0].name,'One');assert.equal(state().members[0].position,'coach');assert.equal(state().members[0].status,'returned');await call(bridge,{action:'member',guild,event:e.id,user});
+await call(bridge,{action:'submit',guild,team:a.id,user,name:'One',...info});assert.equal(state().members[0].status,'pending');
+await call(admin,{action:'decision',id:m.id,approve:true});const aj=state().jobs.find(j=>j.kind==='approve');await call(bridge,{action:'done',id:aj.id});
+const c=await call(bridge,{action:'requestChange',event:e.id,guild,user,kind:'correction',...info,rank:'GOLD 2',position:'reserve',riotId:'別の名前#JP2',displayName:'変更した表示名'});assert.equal(state().members[0].rank,'GOLD 3');
+await call(bridge,{action:'requestChange',event:e.id,guild,user,kind:'withdraw',reason:'quit'},false);
+await call(admin,{action:'changeDecision',id:c.id,mode:'return',reason:'要確認'});await call(bridge,{action:'requestChange',event:e.id,guild,user,kind:'correction',...info,rank:'GOLD 2',position:'reserve',riotId:'別の名前#JP2',displayName:'変更した表示名'});
+await call(admin,{action:'changeDecision',id:c.id,mode:'approve'});let j=state().jobs.find(j=>j.kind==='applyChange');await call(bridge,{action:'done',id:j.id,error:'permission denied'});assert.equal(state().members[0].rank,'GOLD 3');await call(admin,{action:'retry',id:j.id});await call(bridge,{action:'done',id:j.id});assert.equal(state().members[0].rank,'GOLD 2');assert.equal(state().members[0].position,'reserve');assert.equal(state().members[0].riotId,'別の名前#JP2');assert.equal(state().members[0].displayName,'変更した表示名');assert.equal(state().members[0].name,'One');
+const transfer=await call(bridge,{action:'requestChange',event:e.id,guild,user,kind:'transfer',code:b.code,reason:'移動'});await call(admin,{action:'capacity',id:b.id,capacity:2});await call(bridge,{action:'submit',guild,team:b.id,user:u2,name:'Two',...info});await call(admin,{action:'capacity',id:b.id,capacity:1},false);edit(s=>{s.members=s.members.filter(m=>m.user!==u2);});await call(admin,{action:'capacity',id:b.id,capacity:1});await call(bridge,{action:'submit',guild,team:b.id,user:u2,name:'Two',...info},false);await call(admin,{action:'changeDecision',id:transfer.id,mode:'approve'});assert.equal(state().members[0].team,a.id);j=state().jobs.find(j=>j.ref===transfer.id&&j.kind==='applyChange');await call(bridge,{action:'done',id:j.id});assert.equal(state().members[0].team,b.id);
+await call(admin,{action:'registration',event:e.id,...reg,deadline:'2000-01-01T00:00:00Z'});await call(bridge,{action:'code',guild,event:e.id,code:a.code},false);await call(bridge,{action:'submit',guild,team:a.id,user:u2,name:'Two',...info},false);
+const withdrawal=await call(bridge,{action:'requestChange',event:e.id,guild,user,kind:'withdraw',reason:'辞退'});await call(admin,{action:'registrationState',event:e.id,mode:'finalize'},false);await call(admin,{action:'changeDecision',id:withdrawal.id,mode:'approve'});assert.equal(state().members[0].status,'approved');j=state().jobs.find(j=>j.ref===withdrawal.id&&j.kind==='applyChange');await call(bridge,{action:'done',id:j.id});assert.equal(state().members[0].status,'withdrawn');
+await call(admin,{action:'registration',event:e.id,...reg});await call(admin,{action:'points',event:e.id,points:{'GOLD 3':11}});
+for(const [t,u] of [[a,u2],[b,u3]]){const r=await call(bridge,{action:'submit',guild,team:t.id,user:u,name:'Player',...info});await call(admin,{action:'decision',id:r.id,approve:true});const job=state().jobs.find(j=>j.ref===r.id&&j.kind==='approve');await call(bridge,{action:'done',id:job.id});}
+assert(flows.issues(state(),state().teams[0]).includes('上限ポイント超過'));await call(admin,{action:'registrationState',event:e.id,mode:'finalize'},false);await call(admin,{action:'points',event:e.id,points:{'GOLD 3':10}});await call(admin,{action:'registrationState',event:e.id,mode:'finalize'});
+await call(admin,{action:'capacity',id:a.id,capacity:2},false);await call(bridge,{action:'requestChange',event:e.id,guild,user:u2,kind:'withdraw',reason:'辞退'},false);await call(admin,{action:'points',event:e.id,points:{}},false);await call(admin,{action:'registrationState',event:e.id,mode:'unlock'});await call(bridge,{action:'code',guild,event:e.id,code:a.code},false);
+const before=state().changes.length;await call(bridge,{action:'requestChange',event:e.id,guild:'999999999999999999',user:u2,kind:'withdraw',reason:'辞退'},false);assert.equal(state().changes.length,before);
+assert.equal(entry.normalize({...entry.fresh(),changes:undefined}).changes.length,0);
+// Removal commits only after Discord success; cancelled jobs cannot resurrect registrations.
+const re=await call(admin,{action:'event',name:'Removal Cup',guild});
+const rt=await call(admin,{action:'team',event:re.id,name:'Delete me',capacity:3});
+edit(s=>{s.teams.find(t=>t.id===rt.id).status='ready';s.jobs.forEach(j=>j.status='done')});
+const rm=await call(bridge,{action:'submit',guild,team:rt.id,user,name:'One',...info});
+await call(admin,{action:'decision',id:rm.id,approve:true});let rj=state().jobs.find(j=>j.kind==='approve'&&j.ref===rm.id);await call(bridge,{action:'done',id:rj.id});
+const rc=await call(bridge,{action:'requestChange',event:re.id,guild,user,kind:'correction',...info});
+await call(admin,{action:'removeMember',id:rm.id});assert(state().members.find(m=>m.id===rm.id).removing);assert.equal(state().members.find(m=>m.id===rm.id).status,'approved');assert.equal(state().changes.find(c=>c.id===rc.id).status,'cancelled');
+await call(bridge,{action:'requestChange',event:re.id,guild,user,kind:'withdraw',reason:'quit'},false);
+await call(bridge,{action:'submit',guild,team:rt.id,user,name:'One',...info},false);
+rj=state().jobs.find(j=>j.kind==='removeMember'&&j.ref===rm.id);await call(bridge,{action:'done',id:rj.id,error:'Discord permission denied'});assert(state().members.find(m=>m.id===rm.id).removing);assert.equal(state().members.find(m=>m.id===rm.id).status,'approved');
+await call(admin,{action:'retry',id:rj.id});await call(bridge,{action:'done',id:rj.id});assert.equal(state().members.find(m=>m.id===rm.id).status,'removed');assert(!state().members.find(m=>m.id===rm.id).removing);
+await call(bridge,{action:'submit',guild,team:rt.id,user,name:'One',...info});assert.equal(state().members.find(m=>m.id===rm.id).status,'pending');
+await call(admin,{action:'decision',id:rm.id,approve:true});rj=state().jobs.filter(j=>j.kind==='approve'&&j.ref===rm.id).at(-1);edit(s=>{s.jobs.find(j=>j.id===rj.id).status='running'});
+await call(admin,{action:'deleteTeam',id:rt.id},false);assert.equal(state().teams.find(t=>t.id===rt.id).status,'ready');
+await call(bridge,{action:'done',id:rj.id,error:'approval failed'});
+await call(admin,{action:'deleteTeam',id:rt.id});assert.equal(state().teams.find(t=>t.id===rt.id).status,'deleting');assert.equal(state().jobs.find(j=>j.id===rj.id).status,'cancelled');
+await call(bridge,{action:'code',guild,event:re.id,code:rt.code},false);await call(admin,{action:'rotate',id:rt.id},false);await call(admin,{action:'removeMember',id:rm.id},false);
+await call(bridge,{action:'done',id:rj.id});assert.equal(state().members.find(m=>m.id===rm.id).status,'approving');
+let dj=state().jobs.find(j=>j.kind==='deleteTeam'&&j.ref===rt.id);await call(bridge,{action:'done',id:dj.id,error:'deletion failed'});assert.equal(state().teams.find(t=>t.id===rt.id).status,'deleting');
+await call(admin,{action:'retry',id:dj.id});await call(bridge,{action:'done',id:dj.id});assert.equal(state().teams.find(t=>t.id===rt.id).status,'deleted');assert.equal(state().members.find(m=>m.id===rm.id).status,'removed');
+const replacement=await call(admin,{action:'team',event:re.id,name:'Delete me',capacity:3});assert.equal(replacement.number,2);
+edit(s=>{s.events.find(e=>e.id===re.id).registration={...flows.registration(re),finalized:true}});await call(admin,{action:'deleteTeam',id:replacement.id},false);
+console.log('PASS: actual API workflows, deadline/finalization, return/resubmit, capacity reservations, approval failure/retry, transfer, withdrawal, point checks, guild isolation, legacy state');
+})().catch(e=>{console.error(e);process.exit(1)});
